@@ -1,16 +1,22 @@
 {# The template's macros. transform-check knows each one: what it compiles to is how the data-class
    check sees a column de-identified. Don't redefine them in models. #}
 
+{# The transform's helper schema (transform.yaml's schema + _fn), which its own login makes at the
+   start of every run; the runner sets it. #}
+{% macro valxel_helpers() -%}
+  {{ adapter.quote(env_var('TRANSFORM_HELPER_SCHEMA', 'transform_fn')) }}
+{%- endmacro %}
+
 {# A keyed token of a value (HMAC-SHA256 with the session's key): the same input gives the same token,
    so marts still join on it, but the value can't be read back without the key. De-identifies. #}
 {% macro valxel_tokenize(column) -%}
-  valxel.tokenize(({{ column }})::text)
+  {{ valxel_helpers() }}.tokenize(({{ column }})::text)
 {%- endmacro %}
 
 {# A date or time cut to its year (HIPAA safe harbor keeps the year): de-identifies. Any finer cut
    keeps the column's class; use date_trunc for that. #}
 {% macro valxel_generalize_year(column) -%}
-  valxel.generalize_year(({{ column }})::timestamptz)
+  {{ valxel_helpers() }}.generalize_year(({{ column }})::timestamptz)
 {%- endmacro %}
 
 {# The group-size floor for an aggregate mart: groups smaller than this are left out, so a count or

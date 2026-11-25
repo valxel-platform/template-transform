@@ -60,8 +60,8 @@ def test_declaring_higher_than_the_data_is_allowed():
 @pytest.mark.parametrize(
     "expr",
     [
-        "valxel.tokenize((patient_id)::text)",
-        "valxel.generalize_year((signed_at)::timestamptz)",
+        "transform_fn.tokenize((patient_id)::text)",
+        "transform_fn.generalize_year((signed_at)::timestamptz)",
     ],
 )
 def test_the_template_de_identifications_lower_the_class(expr):
@@ -74,19 +74,19 @@ def test_a_finer_cut_or_another_function_does_not_de_identify():
 
 
 def test_only_what_the_de_identification_wraps_is_lowered():
-    sql = f"select valxel.tokenize((patient_id)::text) || signed_at::text as x from {SRC}"
+    sql = f"select transform_fn.tokenize((patient_id)::text) || signed_at::text as x from {SRC}"
     [found] = problems(sql, {"x": "none"})
     assert "signed_at (phi)" in found and "patient_id (phi, de-identified)" in found
 
 
 def test_a_column_used_both_inside_and_outside_a_de_identification_keeps_its_class():
-    sql = f"select valxel.tokenize((patient_id)::text) || patient_id as x from {SRC}"
+    sql = f"select transform_fn.tokenize((patient_id)::text) || patient_id as x from {SRC}"
     assert problems(sql, {"x": "none"})
 
 
 def test_secret_never_de_identifies():
-    assert problems(f"select valxel.tokenize((ssn)::text) as t from {SRC}", {"t": "none"})
-    assert problems(f"select valxel.tokenize((ssn)::text) as t from {SRC}", {"t": "secret"}) == []
+    assert problems(f"select transform_fn.tokenize((ssn)::text) as t from {SRC}", {"t": "none"})
+    assert problems(f"select transform_fn.tokenize((ssn)::text) as t from {SRC}", {"t": "secret"}) == []
 
 
 AGG = "select clinic_id, count(distinct patient_id) as patients, sum(amount) as total from {src} group by 1 {having}"
@@ -145,7 +145,7 @@ def test_a_source_column_without_a_class_fails():
 
 
 def test_the_report_names_each_columns_inputs():
-    report = check(manifest(f"select valxel.tokenize((patient_id)::text) as t from {SRC}", {"t": "none"}))
+    report = check(manifest(f"select transform_fn.tokenize((patient_id)::text) as t from {SRC}", {"t": "none"}))
     assert report.ok and report.as_dict()["columns"] == [
         {
             "model": "mart",
@@ -169,3 +169,10 @@ def test_a_deletions_hook_rendered_at_parse_time_is_caught():
         "post-hook": [{"sql": f"delete from {me} as t where not exists (select 1 from {SRC} as s where s.k = t.k)"}]
     }
     assert check(m).ok
+
+
+def test_only_the_transforms_own_helpers_de_identify():
+    assert problems(f"select other.tokenize((patient_id)::text) as t from {SRC}", {"t": "none"})
+    assert problems(f"select tokenize((patient_id)::text) as t from {SRC}", {"t": "none"})
+    found = check(manifest(f"select emr_fn.tokenize((patient_id)::text) as t from {SRC}", {"t": "none"}), "emr_fn")
+    assert found.problems == []

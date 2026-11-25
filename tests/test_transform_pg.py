@@ -1,6 +1,10 @@
 """The transform end to end on a real Postgres: set TRANSFORM_TEST_DATABASE_URL (a database these
 tests may reset; the login must be able to create roles). CI runs them against its Postgres service.
 
+The fixture plays the platform: it makes the transform's own login with only what postgres-login
+gives it (SELECT on the raw table, CONNECT and CREATE on the database, ADMIN on its break-glass role),
+and every run signs in as that login, so nothing here works only because the tests are superuser.
+
 The deletion test is generic: for every source with a key, it deletes one row from the raw table,
 runs again and proves the key is gone from every mart that carries it (traced by the data-class
 report's lineage), whatever models the product has written.
@@ -24,6 +28,7 @@ from transform.run import SUMMARY, Settings, TransformError, transform
 
 URL = os.environ.get("TRANSFORM_TEST_DATABASE_URL", "")
 KEY = "k" * 40
+LOGIN, LOGIN_PW = "emr_transform", "transform-login-pw-123"
 ROOT = Path(__file__).resolve().parents[1]
 END = datetime(2026, 11, 25, tzinfo=UTC)
 WINDOW = (END - timedelta(days=1), END)
@@ -42,6 +47,12 @@ def sql(*statements: str, url: str = URL) -> list[tuple]:
     return rows
 
 
+def login_url() -> str:
+    from psycopg.conninfo import make_conninfo
+
+    return make_conninfo(URL, user=LOGIN, password=LOGIN_PW)
+
+
 @pytest.fixture
 def warehouse(tmp_path):
     import psycopg
@@ -50,28 +61,44 @@ def warehouse(tmp_path):
         "drop schema if exists transform cascade",
         "drop schema if exists transform_build cascade",
         "drop schema if exists transform_old cascade",
+        "drop schema if exists transform_fn cascade",
         "drop table if exists public.notes",
         "create table if not exists public._reporting_logins (login text, tenant text, primary key (login, tenant))",
         "create or replace function public.reporting_tenants() returns setof text language sql stable"
         " security definer set search_path = pg_catalog, public as"
         " $$ select tenant from public._reporting_logins where login = session_user $$",
+        "truncate public._reporting_logins",
     )
     with psycopg.connect(URL, autocommit=True) as conn:
-        pg.setup(conn)
         seed.seed(conn, ROOT / "dbt", ROOT / "contracts", "public", rows=60)
-    sql("truncate valxel.break_glass", "truncate public._reporting_logins")
     for role in ("clinic_reader", "oncall_person"):
         sql(
             f"do $$ begin if exists (select 1 from pg_roles where rolname = '{role}') then"
             f" drop owned by {role}; drop role {role}; end if; end $$"
         )
+    # What the platform makes (postgres-login) and template-reporting makes (reporting_reader).
+    for role, attrs in (
+        (LOGIN, f"login password '{LOGIN_PW}'"),
+        (f"{LOGIN}_break_glass", "nologin"),
+        ("reporting_reader", "nologin"),
+    ):
+        sql(
+            f"do $$ begin if not exists (select 1 from pg_roles where rolname = '{role}') then"
+            f" create role {role} {attrs}; end if; end $$"
+        )
+    sql(
+        f"do $$ begin execute format('grant connect, create on database %I to {LOGIN}', current_database()); end $$",
+        f"grant usage on schema public to {LOGIN}",
+        f"grant select on public.notes to {LOGIN}",
+        f"grant {LOGIN}_break_glass to {LOGIN} with admin option",
+    )
     project = tmp_path / "dbt"
     shutil.copytree(ROOT / "dbt", project, ignore=shutil.ignore_patterns("target", "logs"))
     evidence = tmp_path / "evidence"
     settings = Settings(
         config_path=str(ROOT / "transform.yaml"),
         project_dir=str(project),
-        database_url=URL,
+        database_url=login_url(),
         tokenize_key=KEY,
         evidence_dir=str(evidence),
         version="abc123",
@@ -122,7 +149,6 @@ def test_a_report_login_sees_only_its_tenants_marts_and_nothing_raw(warehouse):
     sql(
         "create role clinic_reader login password 'reader-pw-123'",
         "grant reporting_reader to clinic_reader",
-        "grant usage on schema valxel to clinic_reader",
         "insert into public._reporting_logins values ('clinic_reader', 'clinic_id-1') on conflict do nothing",
     )
     from psycopg.conninfo import make_conninfo
@@ -206,25 +232,35 @@ def test_break_glass_is_time_boxed_and_revoked_by_the_next_run(warehouse):
 
     run(warehouse)
     sql("create role oncall_person login")
-    with psycopg.connect(URL, autocommit=True) as conn:
-        pg.break_glass_grant(conn, "oncall_person", datetime.now(UTC) - timedelta(minutes=1), "fix a bad row in a mart")
-    assert sql("select pg_has_role('oncall_person', 'transform_break_glass', 'member')")[0][0]
+    cfg = load(ROOT / "transform.yaml")
+    with psycopg.connect(login_url(), autocommit=True) as conn:  # the transform's own login grants it
+        pg.break_glass_grant(conn, cfg, "oncall_person", datetime.now(UTC) - timedelta(minutes=1), "fix a bad row")
+    member = f"select pg_has_role('oncall_person', '{LOGIN}_break_glass', 'member')"
+    assert sql(member)[0][0]
     audits = []
     run(warehouse, audit=lambda a, **kw: audits.append((a, kw)))
-    assert not sql("select pg_has_role('oncall_person', 'transform_break_glass', 'member')")[0][0]
+    assert not sql(member)[0][0]
     assert ("transform.break_glass.revoked", {"resource": ("db_login", ["oncall_person"]), "details": {}}) in audits
-    assert sql("select revoked_at is not null from valxel.break_glass where login = 'oncall_person'") == [(True,)]
+    assert sql("select revoked_at is not null from transform_fn.break_glass where login = 'oncall_person'") == [(True,)]
 
 
-def test_tokens_need_the_sessions_key(warehouse):
+def test_tokens_need_the_sessions_key_and_are_hmac_sha256(warehouse):
+    import hashlib
+    import hmac
+
+    run(warehouse)
     with pytest.raises(Exception, match="no key of at least 32 characters"):
-        sql("select valxel.tokenize('x')")
+        sql("select transform_fn.tokenize('x')")
+    for key in (KEY, "é" * 40, "x" * 100):  # multi-byte, and longer than a block
+        [(token,)] = sql(f"set valxel.tokenize_key = '{key}'", "select transform_fn.tokenize('patient-ü-1')")
+        assert token == hmac.new(key.encode(), "patient-ü-1".encode(), hashlib.sha256).hexdigest()
 
 
-def test_the_grants_name_only_the_declared_sources():
-    cfg = load(ROOT / "transform.yaml")
-    manifest = {"sources": {"s": {"schema": "public", "identifier": "notes"}}}
-    stmts = pg.grants(cfg, manifest, "emr_transform", "emr")
-    assert 'grant select on "public"."notes" to "emr_transform"' in stmts
-    assert 'grant create on database "emr" to "emr_transform"' in stmts
-    assert not [s for s in stmts if "grant select on all" in s or ("insert" in s and "notes" in s)]
+def test_the_login_owns_its_schemas_and_nothing_more(warehouse):
+    run(warehouse)
+    owners = dict(sql("select nspname, pg_get_userbyid(nspowner) from pg_namespace where nspname like 'transform%'"))
+    assert owners == {"transform": LOGIN, "transform_fn": LOGIN}
+    attrs = sql(f"select rolsuper, rolcreaterole, rolcreatedb from pg_roles where rolname = '{LOGIN}'")
+    assert attrs == [(False, False, False)]
+    with pytest.raises(Exception, match="permission denied"):
+        sql("insert into public.notes (note_id) values ('x')", url=login_url())

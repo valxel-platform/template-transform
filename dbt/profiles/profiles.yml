@@ -14,5 +14,5 @@ transform:
       schema: "{{ env_var('TRANSFORM_BUILD_SCHEMA', 'transform_build') }}"
       sslmode: "{{ env_var('TRANSFORM_PG_SSLMODE', 'prefer') }}"
       threads: 4
-      # valxel.tokenize's key reaches each session through libpq's PGOPTIONS, which the runner sets
+      # The tokenize key reaches each session through libpq's PGOPTIONS, which the runner sets
       # from the mounted secret: never in SQL, this file, logs or artifacts.

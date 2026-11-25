@@ -40,3 +40,30 @@ def test_not_yaml_or_not_a_mapping():
         parse("a: [")
     with pytest.raises(ConfigError):
         parse("- a")
+
+
+def test_the_transform_signs_in_with_its_logins_bound_outputs():
+    from psycopg.conninfo import conninfo_to_dict
+
+    from transform.run import Settings, TransformError, database_url
+
+    url = database_url(Settings(pg_host="db.internal", pg_database="emr", pg_user="emr_transform", pg_password="pw"))
+    assert conninfo_to_dict(url) == {
+        "host": "db.internal",
+        "port": "5432",
+        "dbname": "emr",
+        "user": "emr_transform",
+        "password": "pw",
+        "sslmode": "require",
+    }
+    assert database_url(Settings(database_url="postgresql://x@y/z")) == "postgresql://x@y/z"
+    with pytest.raises(TransformError, match="_PASSWORD"):
+        database_url(Settings(pg_host="db.internal", pg_database="emr", pg_user="emr_transform"))
+
+
+def test_the_helper_schema_is_the_transforms_own():
+    from pathlib import Path
+
+    from transform.config import load
+
+    assert load(Path(__file__).resolve().parents[1] / "transform.yaml").helper_schema == "transform_fn"

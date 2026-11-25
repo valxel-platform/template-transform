@@ -40,6 +40,11 @@ class Config:
     def old_schema(self) -> str:
         return f"{self.schema}_old"
 
+    @property
+    def helper_schema(self) -> str:
+        """The transform's functions and break-glass record, made by its own login."""
+        return f"{self.schema}_fn"
+
 
 def parse(raw: Any) -> Config:
     if not isinstance(raw, dict):
