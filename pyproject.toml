@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Valxel transform template: dbt models over the reporting store, run on the job harness's schedule, published only when every test, control total and data-class check passes."
 requires-python = ">=3.12"
 dependencies = [
-  "confluent-kafka>=2.16,<3",
+  "confluent-kafka>=2.16.2,<3",
   "dbt-core>=1.12,<1.13",
   "dbt-postgres>=1.11,<1.12",
   "sqlglot>=30.35,<31",
