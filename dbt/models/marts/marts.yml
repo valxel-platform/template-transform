@@ -1,0 +1,39 @@
+version: 2
+models:
+  - name: notes_signed
+    description: Signed notes, de-identified.
+    meta: { tenant: clinic_id }
+    data_tests:
+      - valxel_control_total:
+          arguments:
+            measure: count(*)
+            against: ref('stg_notes')
+            against_where: signed_at is not null
+      - valxel_control_total:
+          arguments:
+            measure: count(distinct note_id)
+            against: ref('stg_notes')
+            against_where: signed_at is not null
+    columns:
+      - { name: note_id, meta: { data_class: none }, data_tests: [unique, not_null] }
+      - { name: kind, meta: { data_class: none } }
+      - { name: clinic_id, meta: { data_class: none } }
+      - { name: patient_token, meta: { data_class: none } }
+      - { name: signed_year, meta: { data_class: none } }
+      - { name: _updated_at, meta: { data_class: none } }
+  - name: notes_by_clinic_year
+    description: Notes per clinic and year; groups under 11 notes are left out.
+    meta: { tenant: clinic_id }
+    data_tests:
+      - valxel_control_total:
+          arguments:
+            measure: sum(notes)
+            against: ref('stg_notes')
+            against_measure: count(*)
+            against_where: signed_at is not null
+            compare: at_most
+    columns:
+      - { name: clinic_id, meta: { data_class: none } }
+      - { name: year, meta: { data_class: none } }
+      - { name: notes, meta: { data_class: none } }
+      - { name: patients, meta: { data_class: none } }

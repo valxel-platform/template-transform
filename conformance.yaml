@@ -1,0 +1,19 @@
+# The template conformance suite (.github/scripts/conformance.py, managed by the platform): the built
+# image does what every job repo must. One real run against its own database: the warehouse set up
+# and seeded with synthetic raw tables (TRANSFORM_SEED_SYNTHETIC, refused outside ci and dev), every
+# model built and tested, the data-class check, the marts published and audited, and it exits.
+image: "ci"  # the tag CI builds
+command: "uv run job-run"  # conformance.py local: the job as a process
+once: true
+postgres: "postgres:17-alpine"
+env:
+  JOB_ENVIRONMENT: ci
+  JOB_DATABASE_URL: "{postgres}"
+  JOB_PRODUCT: conformance
+  JOB_AUDIT_SINK: log
+  TRANSFORM_DATABASE_URL: "{postgres}"
+  TRANSFORM_TOKENIZE_KEY: "conformance-only-key-0123456789abcdef"
+  TRANSFORM_SEED_SYNTHETIC: "true"
+# The transform reads no feature flag and records no product event: a release of a transform is a
+# new set of models, approved at G4 and published only when its tests pass.
+checks: [audit, tracing]

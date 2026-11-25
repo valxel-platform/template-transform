@@ -1,0 +1,24 @@
+# Where this template implements each capability its role needs (agentic-sdlc config/template-contract.yaml).
+# valxel repos check reads this file; keep a path here when you move the code.
+audit: src/job/audit.py
+conformance: .github/workflows/ci.yml
+dependency-review: .github/workflows/ci.yml
+dependency-updates: .github/dependabot.yml
+error-reports: src/job/errors.py
+flag-cohorts: src/job/cohorts.py
+flags: src/job/flags.py
+image-scan: .github/workflows/ci.yml
+json-logs: src/job/logs.py
+product-events: src/job/events.py
+security-policy: SECURITY.md
+security-scans: .github/workflows/security.yml
+supply-chain-pins: .github/workflows/supply-chain-pins.yml
+tracing: src/job/telemetry.py
+# transform role (CP-126)
+data-classes: src/transform/classes.py
+control-totals: dbt/macros/valxel.sql
+publish-on-pass: src/transform/pg.py
+deletions: dbt/macros/valxel.sql
+least-privilege: src/transform/pg.py
+break-glass: src/transform/admin.py
+run-evidence: src/transform/run.py

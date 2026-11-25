@@ -1,0 +1,5 @@
+# Files that carry this template's name. When the SDLC tool creates a repo from the template, it
+# replaces the template's name with the new component's in each: job.yaml's name keys the run
+# history and the run lock; component.py names it in error reports, traces and audit records.
+job.yaml
+src/job/component.py

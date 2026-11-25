@@ -1,0 +1,45 @@
+{
+  "$id": "valxel:dataset/emr.notes/1.3.0",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "body": {
+      "type": "string",
+      "x-classification": "phi"
+    },
+    "clinic_id": {
+      "type": "string",
+      "x-classification": "none"
+    },
+    "kind": {
+      "enum": [
+        "progress",
+        "discharge"
+      ],
+      "type": "string",
+      "x-classification": "none"
+    },
+    "note_id": {
+      "format": "uuid",
+      "type": "string",
+      "x-classification": "none"
+    },
+    "patient_id": {
+      "type": "string",
+      "x-classification": "phi"
+    },
+    "signed_at": {
+      "format": "date-time",
+      "type": "string",
+      "x-classification": "none"
+    }
+  },
+  "required": [
+    "note_id",
+    "patient_id",
+    "kind",
+    "clinic_id"
+  ],
+  "title": "Clinical notes",
+  "type": "object"
+}

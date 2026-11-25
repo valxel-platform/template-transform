@@ -1,0 +1,18 @@
+# Connections, from the environment the job runs with. The schema is the build schema the runner
+# sets for each run (TRANSFORM_BUILD_SCHEMA); readers only ever see the schema it's swapped into.
+# DBT_ENV_SECRET_ values are kept out of dbt's logs and artifacts.
+transform:
+  target: "{{ env_var('TRANSFORM_WAREHOUSE', 'postgres') }}"
+  outputs:
+    postgres:
+      type: postgres
+      host: "{{ env_var('TRANSFORM_PG_HOST', 'localhost') }}"
+      port: "{{ env_var('TRANSFORM_PG_PORT', '5432') | as_number }}"
+      user: "{{ env_var('TRANSFORM_PG_USER', 'transform') }}"
+      password: "{{ env_var('DBT_ENV_SECRET_PG_PASSWORD', '') }}"
+      dbname: "{{ env_var('TRANSFORM_PG_DATABASE', 'product') }}"
+      schema: "{{ env_var('TRANSFORM_BUILD_SCHEMA', 'transform_build') }}"
+      sslmode: "{{ env_var('TRANSFORM_PG_SSLMODE', 'prefer') }}"
+      threads: 4
+      # valxel.tokenize's key reaches each session through libpq's PGOPTIONS, which the runner sets
+      # from the mounted secret: never in SQL, this file, logs or artifacts.
