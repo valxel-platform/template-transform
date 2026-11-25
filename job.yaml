@@ -1,0 +1,12 @@
+# When the job runs. The Valxel SDLC sets the CronJob's schedule, time zone, time limit and
+# suspend flag from this file each time it deploys, per environment; the job reads it for the
+# window a run covers and to notice missed runs. Change the schedule through a pull request.
+name: template-transform    # the component's name (replaced when a repo is created from this template)
+schedule: "15 3 * * *"          # minute hour day-of-month month day-of-week (numbers only)
+timezone: America/Chicago       # an IANA time zone; daylight saving moves the run with local time
+time_limit_minutes: 30          # the run stops itself 30 s before this; Kubernetes stops the pod at it
+catch_up: window                # window: a run covers everything since the last success; latest: its own period only
+missed_after: 2                 # log valxel.job.missed after this many scheduled runs without a success
+environments:                   # optional: another schedule, or suspend: true, outside production
+  dev: { schedule: "15 * * * *" }
+  staging: { schedule: "45 */6 * * *" }

@@ -1,0 +1,18 @@
+# Written by the Valxel SDLC from the datasets the design lets this transform read; don't edit by
+# hand. Each column carries its data class from the dataset's contract (after reporting's tokenize
+# and generalize rules): models can only source() these, and transform-check classes every output
+# from them. The example: reporting's notes table (synthetic EMR).
+version: 2
+sources:
+  - name: reporting
+    schema: "{{ env_var('TRANSFORM_SOURCE_SCHEMA', 'public') }}"
+    tables:
+      - name: notes
+        meta: { dataset: emr.notes, key: note_id, tenant: clinic_id }
+        columns:
+          - { name: note_id, meta: { data_class: none } }
+          - { name: kind, meta: { data_class: none } }
+          - { name: clinic_id, meta: { data_class: none } }
+          - { name: patient_id, meta: { data_class: phi } }
+          - { name: signed_at, meta: { data_class: phi } }
+          - { name: _updated_at, meta: { data_class: none } }

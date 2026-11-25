@@ -1,0 +1,132 @@
+# Required checks on the default branch: unit (and CodeQL, from default setup).
+# Job names are the check names the Valxel SDLC and the branch ruleset look for; keep them.
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  merge_group:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  REPORT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+
+jobs:
+  unit:
+    name: unit
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      statuses: write
+    # The run lock and run history are tested against Postgres.
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres" --health-interval 2s --health-timeout 5s --health-retries 30
+    env:
+      JOB_TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/postgres
+      TRANSFORM_TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/postgres
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0 # the base branch, for coverage of new code
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          enable-cache: true
+      - run: uv sync --locked
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
+      - run: uv run mypy
+      # job.yaml's schedule, time zone and limits, in every environment: what the platform deploys.
+      - run: |
+          for env in dev staging production; do JOB_ENVIRONMENT=$env uv run job-run --check; done
+      - run: uv run pytest
+      # The data-class check on the models as they are on the branch (transform/classes.py): every
+      # output column at least as sensitive as what it's made from. The tests above run it too; this
+      # prints the report the reviewer reads.
+      - name: Data classes
+        env:
+          TRANSFORM_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/postgres
+          TRANSFORM_TOKENIZE_KEY: ci-only-key-0123456789abcdef0123456789
+        run: uv run transform-check
+      - name: Report results
+        if: ${{ !cancelled() }}
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 .github/scripts/report.py --context "unit / report" --junit reports/junit.xml --cobertura coverage.xml
+      - name: Coverage on new code
+        if: github.event_name == 'pull_request' && !cancelled()
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          pipx run diff-cover==11.0.2 coverage.xml --compare-branch="origin/$BASE_REF" \
+            --format json:new-code.json
+          python3 .github/scripts/report.py --context "code-quality / new code" --new-code new-code.json
+
+  dependency-review:
+    name: dependency-review
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
+        with:
+          fail-on-severity: high
+          comment-summary-in-pr: on-failure
+  image:
+    name: image
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # OpenChoreo builds and ships the image; this proves it builds, runs once as the platform runs
+      # it (read-only root file system, /tmp only) and has no known high or critical vulnerabilities
+      # with a fix available, on every PR.
+      - run: docker build --pull -t ci .
+      - name: Run the image once
+        run: |
+          docker run --rm --read-only --tmpfs /tmp --cap-drop ALL --security-opt no-new-privileges ci job-run --check
+      # A real run (build, tests, data classes, publish) is the conformance step below: it needs Postgres.
+      # Syft and Grype run as containers (pinned versions), not as marketplace actions.
+      # The template contract on the built image, run as the platform runs it
+      # (.github/scripts/conformance.py, conformance.yaml): an audit record that meets the shared
+      # schema, spans at a collector, product events, flags through OFREP.
+      - name: Conformance
+        run: |
+          docker rm -f smoke || true
+          python3 -m venv /tmp/conformance
+          /tmp/conformance/bin/pip install -q pyyaml==6.0.3 jsonschema==4.25.1 "pyjwt[crypto]==2.10.1"
+          /tmp/conformance/bin/python .github/scripts/conformance.py image
+      - name: Software bill of materials
+        run: |
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock anchore/syft:v1.57.1 \
+            docker:ci -o cyclonedx-json > sbom.cyclonedx.json
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sbom
+          path: sbom.cyclonedx.json
+          retention-days: 30
+      - name: Scan for vulnerabilities with a fix
+        run: |
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock anchore/grype:v0.121.3 \
+            docker:ci --only-fixed --fail-on high

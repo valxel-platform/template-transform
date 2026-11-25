@@ -1,0 +1,74 @@
+[project]
+name = "transform"
+version = "0.1.0"
+description = "Valxel transform template: dbt models over the reporting store, run on the job harness's schedule, published only when every test, control total and data-class check passes."
+requires-python = ">=3.12"
+dependencies = [
+  "confluent-kafka>=2.16,<3",
+  "dbt-core>=1.12,<1.13",
+  "dbt-postgres>=1.11,<1.12",
+  "sqlglot>=30.35,<31",
+  "httpx>=0.28,<1",
+  "openfeature-sdk>=0.10,<1",
+  "openfeature-provider-ofrep>=0.3,<1",
+  "opentelemetry-sdk>=1.45,<2",
+  "opentelemetry-exporter-otlp-proto-http>=1.45,<2",
+  "opentelemetry-instrumentation-httpx>=0.66b2",
+  "opentelemetry-instrumentation-psycopg>=0.66b2",
+  "psycopg[binary]>=3.3.9,<4",
+  "sentry-sdk>=2.72,<3",
+  "pydantic-settings>=2.16,<3",
+  "pyyaml>=6.0,<7",
+  "tzdata>=2025.2",
+]
+
+[project.scripts]
+job-run = "job.main:main"
+transform-check = "transform.admin:check_main"
+transform-admin = "transform.admin:admin_main"
+transform-dev = "transform.admin:dev_main"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.2",
+    "pytest-cov>=7.1",
+    "ruff>=0.17",
+    "mypy>=2.4",
+    "types-pyyaml",
+    "jsonschema>=4.26.0",
+    "types-jsonschema>=4.26.0.20261006",
+]
+
+[build-system]
+requires = ["hatchling>=1.33.0"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/job", "src/transform"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+extend-exclude = [".github"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "S", "BLE", "SIM", "RUF", "N"]
+ignore = ["S101"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S105", "S106", "S608"]  # tests compose SQL from their own fixed names
+
+[tool.mypy]
+strict = true
+packages = ["job", "transform"]
+mypy_path = "src"
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+markers = ["postgres: needs JOB_TEST_DATABASE_URL"]
+addopts = "-q --cov=job --cov-report=term --cov-report=xml --junitxml=reports/junit.xml"
+
+[tool.coverage.report]
+fail_under = 90

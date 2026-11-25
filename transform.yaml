@@ -1,0 +1,9 @@
+# How the transform runs and publishes. Agents write this from the HLD's Pipelines section; people
+# approve it at G4 with the models. When it runs is job.yaml's (the job harness), in step with the
+# loads it reads.
+name: template-transform
+warehouse: postgres            # postgres (the reporting store's database) or snowflake (later)
+schema: transform              # what readers see; each run builds in <schema>_build and swaps it in
+source_schema: public          # where reporting's raw tables are
+marts:                         # retention per mart that keeps history (incremental); others follow their sources
+  notes_signed: { retention_days: 2555, retention_column: _updated_at }

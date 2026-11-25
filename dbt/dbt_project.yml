@@ -1,0 +1,24 @@
+# The product's transforms: SQL models over the raw tables the reporting component loads. The coder
+# writes models/ and their .yml files; the tool writes models/sources.yml from the datasets the
+# design lets this transform read. Everything else here is the template's: keep it.
+name: valxel_transform
+version: "1.0.0"
+config-version: 2
+profile: transform
+
+model-paths: [models]
+macro-paths: [macros]
+test-paths: [tests]
+target-path: target
+clean-targets: [target]
+
+models:
+  valxel_transform:
+    +persist_docs: { relation: true, columns: true }
+    staging:
+      +materialized: view
+    marts:
+      +materialized: table
+
+tests:
+  +severity: error   # every test blocks publication; a warning is not a pass
