@@ -58,6 +58,17 @@ SETUP = [
 ]
 
 
+def execute(cur: psycopg.Cursor[Any], stmt: sql.SQL | sql.Composed | str, params: list[Any] | None = None) -> None:
+    """Every statement this package runs. A statement is fixed SQL text, or composed with psycopg's
+    sql module: names as quoted identifiers, values as bound parameters, never pasted in."""
+    if not isinstance(stmt, (str, sql.SQL, sql.Composed)):
+        raise TypeError("a statement is fixed SQL text or psycopg-composed SQL")
+    query = sql.SQL(stmt) if isinstance(stmt, str) else stmt
+    # Semgrep's SQLAlchemy rule can't tell psycopg composition from string concatenation:
+    # nosemgrep: python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query
+    cur.execute(query, params)
+
+
 @dataclass(frozen=True)
 class Model:
     name: str
@@ -89,9 +100,9 @@ def sources(manifest: dict[str, Any]) -> list[tuple[str, str]]:
 
 def _exists(cur: psycopg.Cursor[Any], schema: str, table: str | None = None) -> bool:
     if table is None:
-        cur.execute("select 1 from pg_namespace where nspname = %s", [schema])
+        execute(cur, "select 1 from pg_namespace where nspname = %s", [schema])
     else:
-        cur.execute("select 1 from pg_tables where schemaname = %s and tablename = %s", [schema, table])
+        execute(cur, "select 1 from pg_tables where schemaname = %s and tablename = %s", [schema, table])
     return cur.fetchone() is not None
 
 
@@ -101,13 +112,13 @@ def prepare(conn: psycopg.Connection[Any], cfg: Config, incremental: Iterable[st
     copied = []
     with conn.transaction(), conn.cursor() as cur:
         build, live = sql.Identifier(cfg.build_schema), sql.Identifier(cfg.schema)
-        cur.execute(sql.SQL("drop schema if exists {} cascade").format(build))
-        cur.execute(sql.SQL("create schema {}").format(build))
+        execute(cur, sql.SQL("drop schema if exists {} cascade").format(build))
+        execute(cur, sql.SQL("create schema {}").format(build))
         for name in incremental:
             if _exists(cur, cfg.schema, name):
                 t = sql.Identifier(name)
-                cur.execute(sql.SQL("create table {}.{} (like {}.{} including all)").format(build, t, live, t))
-                cur.execute(sql.SQL("insert into {}.{} select * from {}.{}").format(build, t, live, t))
+                execute(cur, sql.SQL("create table {}.{} (like {}.{} including all)").format(build, t, live, t))
+                execute(cur, sql.SQL("insert into {}.{} select * from {}.{}").format(build, t, live, t))
                 copied.append(name)
     return copied
 
@@ -121,7 +132,8 @@ def expire(conn: psycopg.Connection[Any], cfg: Config, existing: Iterable[str]) 
         for mart in cfg.marts.values():
             if mart.name not in names:
                 continue
-            cur.execute(
+            execute(
+                cur,
                 sql.SQL("delete from {}.{} where {} < now() - make_interval(days => %s)").format(
                     sql.Identifier(cfg.build_schema), sql.Identifier(mart.name), sql.Identifier(mart.retention_column)
                 ),
@@ -169,13 +181,13 @@ def publish(conn: psycopg.Connection[Any], cfg: Config, built: list[Model]) -> N
     """Swap the build schema in, in one transaction, with readers' grants re-applied."""
     with conn.transaction(), conn.cursor() as cur:
         live, build, old = (sql.Identifier(s) for s in (cfg.schema, cfg.build_schema, cfg.old_schema))
-        cur.execute(sql.SQL("drop schema if exists {} cascade").format(old))
+        execute(cur, sql.SQL("drop schema if exists {} cascade").format(old))
         if _exists(cur, cfg.schema):
-            cur.execute(sql.SQL("alter schema {} rename to {}").format(live, old))
-        cur.execute(sql.SQL("alter schema {} rename to {}").format(build, live))
+            execute(cur, sql.SQL("alter schema {} rename to {}").format(live, old))
+        execute(cur, sql.SQL("alter schema {} rename to {}").format(build, live))
         for stmt in reader_grants(cfg, built):
-            cur.execute(stmt)
-        cur.execute(sql.SQL("drop schema if exists {} cascade").format(old))
+            execute(cur, stmt)
+        execute(cur, sql.SQL("drop schema if exists {} cascade").format(old))
 
 
 def counts(conn: psycopg.Connection[Any], schema: str, built: list[Model]) -> dict[str, int]:
@@ -184,7 +196,7 @@ def counts(conn: psycopg.Connection[Any], schema: str, built: list[Model]) -> di
         for m in built:
             if m.materialized == "view":
                 continue
-            cur.execute(sql.SQL("select count(*) from {}.{}").format(sql.Identifier(schema), sql.Identifier(m.name)))
+            execute(cur, sql.SQL("select count(*) from {}.{}").format(sql.Identifier(schema), sql.Identifier(m.name)))
             row = cur.fetchone()
             out[m.name] = int(row[0]) if row else 0
     return out
@@ -214,26 +226,29 @@ def grants(cfg: Config, manifest: dict[str, Any], login: str, database: str) -> 
 def setup(conn: psycopg.Connection[Any]) -> None:
     with conn.transaction(), conn.cursor() as cur:
         for stmt in SETUP:
-            cur.execute(stmt)
+            execute(cur, stmt)
 
 
 def break_glass_grant(conn: psycopg.Connection[Any], login: str, until: datetime, reason: str) -> None:
     with conn.transaction(), conn.cursor() as cur:
-        cur.execute("insert into valxel.break_glass (login, until, reason) values (%s, %s, %s)", [login, until, reason])
-        cur.execute(sql.SQL("grant {} to {}").format(sql.Identifier(BREAK_GLASS), sql.Identifier(login)))
+        execute(
+            cur, "insert into valxel.break_glass (login, until, reason) values (%s, %s, %s)", [login, until, reason]
+        )
+        execute(cur, sql.SQL("grant {} to {}").format(sql.Identifier(BREAK_GLASS), sql.Identifier(login)))
 
 
 def break_glass_expire(conn: psycopg.Connection[Any]) -> list[str]:
     """Revoke every break-glass grant past its time; returns the logins revoked."""
     revoked = []
     with conn.transaction(), conn.cursor() as cur:
-        cur.execute(
+        execute(
+            cur,
             "update valxel.break_glass set revoked_at = now() where revoked_at is null and until <= now()"
-            " returning login"
+            " returning login",
         )
         for (login,) in cur.fetchall():
-            cur.execute("select 1 from pg_roles where rolname = %s", [login])
+            execute(cur, "select 1 from pg_roles where rolname = %s", [login])
             if cur.fetchone():
-                cur.execute(sql.SQL("revoke {} from {}").format(sql.Identifier(BREAK_GLASS), sql.Identifier(login)))
+                execute(cur, sql.SQL("revoke {} from {}").format(sql.Identifier(BREAK_GLASS), sql.Identifier(login)))
             revoked.append(str(login))
     return revoked

@@ -18,6 +18,8 @@ import psycopg
 import yaml
 from psycopg import sql
 
+from .pg import execute
+
 BASE = datetime(2025, 1, 1, tzinfo=UTC)
 
 
@@ -62,11 +64,12 @@ def sources(project: Path) -> list[dict[str, Any]]:
 def seed(conn: psycopg.Connection[Any], project: Path, contracts: Path, schema: str, rows: int = 60) -> dict[str, int]:
     out = {}
     with conn.transaction(), conn.cursor() as cur:
-        cur.execute(sql.SQL("create schema if not exists {}").format(sql.Identifier(schema)))
+        execute(cur, sql.SQL("create schema if not exists {}").format(sql.Identifier(schema)))
         if not _has_function(cur, "reporting_tenants"):  # reporting makes the real one; locally, no tenants
-            cur.execute(
+            execute(
+                cur,
                 "create function public.reporting_tenants() returns setof text language sql stable"
-                " as $$ select null::text where false $$"
+                " as $$ select null::text where false $$",
             )
         for table in sources(project):
             meta = table.get("meta") or {}
@@ -80,22 +83,23 @@ def seed(conn: psycopg.Connection[Any], project: Path, contracts: Path, schema: 
             defs = sql.SQL(", ").join(
                 sql.SQL("{} {}").format(sql.Identifier(c), sql.SQL(column_type(props.get(c, {})))) for c in cols
             )
-            cur.execute(sql.SQL("drop table if exists {}").format(name))
-            cur.execute(
+            execute(cur, sql.SQL("drop table if exists {}").format(name))
+            execute(
+                cur,
                 sql.SQL(
                     "create table {} ({}, _offset bigint not null default 0, _partition int not null default 0,"
                     " _updated_at timestamptz not null default now(), primary key ({}))"
-                ).format(name, defs, sql.Identifier(str(key or cols[0])))
+                ).format(name, defs, sql.Identifier(str(key or cols[0]))),
             )
             ins = sql.SQL("insert into {} ({}) values ({})").format(
                 name, sql.SQL(", ").join(map(sql.Identifier, cols)), sql.SQL(", ").join(sql.Placeholder() * len(cols))
             )
             for i in range(rows):
-                cur.execute(ins, [value(c, props.get(c, {}), i, tenant) for c in cols])
+                execute(cur, ins, [value(c, props.get(c, {}), i, tenant) for c in cols])
             out[table["name"]] = rows
     return out
 
 
 def _has_function(cur: psycopg.Cursor[Any], name: str) -> bool:
-    cur.execute("select 1 from pg_proc where proname = %s", [name])
+    execute(cur, "select 1 from pg_proc where proname = %s", [name])
     return cur.fetchone() is not None

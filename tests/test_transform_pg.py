@@ -125,9 +125,9 @@ def test_a_report_login_sees_only_its_tenants_marts_and_nothing_raw(warehouse):
         "grant usage on schema valxel to clinic_reader",
         "insert into public._reporting_logins values ('clinic_reader', 'clinic_id-1') on conflict do nothing",
     )
-    reader = URL.replace("://postgres@", "://clinic_reader:reader-pw-123@").replace("://postgres:", "://clinic_reader:")
-    if "clinic_reader" not in reader:
-        pytest.skip("the test URL's login isn't postgres; can't derive a reader URL")
+    from psycopg.conninfo import make_conninfo
+
+    reader = make_conninfo(URL, user="clinic_reader", password="reader-pw-123")
     tenants = sql("select distinct clinic_id from transform.notes_signed", url=reader)
     assert tenants == [("clinic_id-1",)]
     with pytest.raises(Exception, match="permission denied"):
