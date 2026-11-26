@@ -50,11 +50,11 @@ The example models build two marts over reporting's synthetic `notes` table:
 | --- | --- | --- |
 | Data classes through SQL | Every output column is traced through the SQL to the source columns it's made from (sqlglot). Its declared class must be at least the highest among them, unless the path goes through `valxel_tokenize`, `valxel_generalize_year`, or a `count`/`sum`/`avg` in a model with `valxel_min_group(11)` or more. `secret` never de-identifies; `min`/`max` don't de-identify. An undeclared column, `select *` or a declared column that isn't in the SQL fails too. | `src/transform/classes.py`, `transform-check` |
 | Control totals | `valxel_control_total`: a measure on the model against the same, or another, measure on what it's built from, within a tolerance (`compare: equal` or `at_most`). Blocking. | `dbt/macros/valxel.sql` |
-| Tokens | `valxel.tokenize`: HMAC-SHA256 with the session's key, from the transform's mounted secret through libpq's `PGOPTIONS`, so the key is never in SQL, dbt's logs or artifacts. A session without a key of 32+ characters fails instead of producing guessable tokens. | `src/transform/pg.py` |
+| Tokens | `valxel_tokenize`: HMAC-SHA256 (on Postgres's built-in sha256, no extension) with the session's key, the login's own, through libpq's `PGOPTIONS`, so the key is never in SQL, dbt's logs or artifacts. A session without a key of 32+ characters fails instead of producing guessable tokens. The functions live in the transform's own helper schema, `<schema>_fn`; the data-class check counts only those. | `src/transform/pg.py` |
 | Deletions | Reporting deletes a raw row on a `.deleted` event. Full rebuilds follow it. An incremental model removes what's gone with `post_hook=["{{ valxel_deletions(source(...), '<key>') }}"]`, quoted so it renders at run time; `transform-check` fails an unquoted one. A test deletes a source row and proves it's gone from every mart that carries its key. | `dbt/macros/valxel.sql`, `tests/test_transform_pg.py` |
-| Least privilege | `transform-admin grants` renders the transform login's grants from the approved sources: select on those raw tables, create for its own schemas, nothing else. The platform applies them. | `src/transform/pg.py` |
+| Least privilege | The transform signs in with a login of its own, never the database owner's: platform-resources' `postgres-login`, made when it deploys from the contracts it reads. SELECT on exactly those columns, CREATE on the database for its own schemas, ADMIN on `<login>_break_glass`; no superuser, createrole or createdb. It makes its helper, build and published schemas itself. | `src/transform/pg.py` |
 | Only writer | The transform login owns the published schema. Report logins (`reporting_reader`) read marts only, with row security by tenant through `reporting_tenants()`. Views run with the reader's rights (`security_invoker`). Staging and intermediate models, which still hold raw columns, aren't readable. | `src/transform/pg.py` |
-| Break-glass | `transform-admin break-glass --login L --minutes N --reason "..."`: write on the marts for at most 240 minutes, recorded in `valxel.break_glass`, revoked by the first run after it ends (audited). | `src/transform/admin.py` |
+| Break-glass | `transform-admin break-glass --login L --minutes N --reason "..."`: write on the marts for at most 240 minutes, recorded in `<schema>_fn.break_glass`, revoked by the first run after it ends (audited). | `src/transform/admin.py` |
 | Query audit | The platform's Postgres runs pgaudit on the reporting store's database; its logs go to the product's audit topic. Not in this repo. | platform |
 | Evidence | Manifest, run results, data-class report and summary per run. | `src/transform/run.py` |
 
@@ -108,12 +108,12 @@ and G4 checks it.
 | `JOB_COHORTS_SLOW_MS` | `5000` | An item slower than this counts as slow in its flag cohort |
 | `SENTRY_DSN`, `SENTRY_RELEASE` | none | Error reports (GlitchTip takes the same DSN) |
 | `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_SERVICE_NAME` | none | Where traces go; unset, traces are made but not exported |
-
-| `TRANSFORM_DATABASE_URL_FILE` | `/var/run/secrets/valxel/transform-database-url` | The warehouse connection as the transform's login, a mounted file (`TRANSFORM_DATABASE_URL` for local runs only) |
-| `TRANSFORM_TOKENIZE_KEY_FILE` | `/var/run/secrets/valxel/transform-tokenize-key` | `valxel.tokenize`'s key, 32+ characters, a mounted file (`TRANSFORM_TOKENIZE_KEY` for local runs only) |
+| `TRANSFORM_PG_HOST`, `_PORT`, `_DATABASE`, `_USER`, `_PASSWORD` | none, `5432` | The transform's own login (postgres-login's outputs, bound in workload.yaml; the password from its Secret). `TRANSFORM_PG_SSLMODE` defaults to `require` |
+| `TRANSFORM_TOKENIZE_KEY` | none | The tokenize key, 32+ characters: the login's own, bound from its Secret (or a mounted file at `TRANSFORM_TOKENIZE_KEY_FILE`) |
+| `TRANSFORM_DATABASE_URL` | none | Local runs only, instead of the parts (or a mounted file at `TRANSFORM_DATABASE_URL_FILE`) |
 | `TRANSFORM_EVIDENCE_DIR` | none | Where each run's evidence is kept |
 | `TRANSFORM_VERSION` | none | The deployed commit, in the evidence (the Valxel SDLC sets it) |
-| `TRANSFORM_SEED_SYNTHETIC` | `false` | CI and local only: set up the warehouse and seed synthetic raw tables first; refused unless `JOB_ENVIRONMENT` is `ci` or `dev` |
+| `TRANSFORM_SEED_SYNTHETIC` | `false` | CI and local only: make the roles environments have and seed synthetic raw tables first; refused unless `JOB_ENVIRONMENT` is `ci` or `dev` |
 
 Without `JOB_DATABASE_URL`, runs keep no history, so missed and overlapping runs can't be detected.
 That's fine for a local try, but not for an environment.

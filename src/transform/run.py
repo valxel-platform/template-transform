@@ -32,7 +32,7 @@ from pathlib import Path
 from typing import Any
 
 import psycopg
-from psycopg.conninfo import conninfo_to_dict
+from psycopg.conninfo import conninfo_to_dict, make_conninfo
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from . import classes, pg
@@ -47,12 +47,20 @@ class Settings(BaseSettings):
 
     config_path: str = "transform.yaml"
     project_dir: str = "dbt"
-    # The warehouse connection, as the transform's own login. A mounted file in environments; the
-    # variable only for local runs (transform-dev).
+    # The warehouse connection, as the transform's own login (platform-resources postgres-login). In
+    # environments the login's outputs reach the pod as TRANSFORM_PG_HOST, _PORT, _DATABASE, _USER
+    # and _PASSWORD (workload.yaml binds them; the password from its Secret). Otherwise a URL: the
+    # variable for local runs (transform-dev), or a mounted file.
+    pg_host: str = ""
+    pg_port: int = 5432
+    pg_database: str = ""
+    pg_user: str = ""
+    pg_password: str = ""
+    pg_sslmode: str = "require"
     database_url: str = ""
     database_url_file: str = "/var/run/secrets/valxel/transform-database-url"
-    # valxel.tokenize's key (at least 32 characters). A mounted file; never an environment variable
-    # outside local runs.
+    # The tokenize key (at least 32 characters): the login's own, bound from its Secret as
+    # TRANSFORM_TOKENIZE_KEY, or a mounted file.
     tokenize_key: str = ""
     tokenize_key_file: str = "/var/run/secrets/valxel/transform-tokenize-key"
     evidence_dir: str = ""  # where each run's evidence is kept (a mounted volume); unset: not kept
@@ -75,6 +83,22 @@ def _secret(value: str, path: str, what: str) -> str:
         raise TransformError(f"no {what}: mount it at {path}") from e
 
 
+def database_url(settings: Settings) -> str:
+    """The transform's own login: the bound parts when there are any, else a URL."""
+    if settings.pg_host:
+        if not (settings.pg_user and settings.pg_password and settings.pg_database):
+            raise TransformError("TRANSFORM_PG_HOST is set: TRANSFORM_PG_USER, _PASSWORD and _DATABASE are needed too")
+        return make_conninfo(
+            host=settings.pg_host,
+            port=settings.pg_port,
+            dbname=settings.pg_database,
+            user=settings.pg_user,
+            password=settings.pg_password,
+            sslmode=settings.pg_sslmode,
+        )
+    return _secret(settings.database_url, settings.database_url_file, "database URL")
+
+
 def dbt_env(url: str, cfg: Config, key: str) -> dict[str, str]:
     """What dbt's profile reads (dbt/profiles/profiles.yml). The password and the key reach dbt only
     through DBT_ENV_SECRET_ and libpq's PGOPTIONS, which dbt keeps out of its logs and artifacts."""
@@ -91,6 +115,7 @@ def dbt_env(url: str, cfg: Config, key: str) -> dict[str, str]:
         "DBT_ENV_SECRET_PG_PASSWORD": str(info.get("password") or ""),
         "TRANSFORM_BUILD_SCHEMA": cfg.build_schema,
         "TRANSFORM_SOURCE_SCHEMA": cfg.source_schema,
+        "TRANSFORM_HELPER_SCHEMA": cfg.helper_schema,
         "PGOPTIONS": f"-c valxel.tokenize_key={key}",
         "DBT_SEND_ANONYMOUS_USAGE_STATS": "false",  # nothing leaves for dbt Labs; nothing written beside the profile
     }
@@ -159,7 +184,7 @@ def transform(
 ) -> dict[str, Any]:
     """One run; returns the summary (also logged and kept as evidence). Raises TransformError."""
     cfg = load(Path(settings.config_path))
-    url = _secret(settings.database_url, settings.database_url_file, "database URL")
+    url = database_url(settings)
     key = _secret(settings.tokenize_key, settings.tokenize_key_file, "tokenize key")
     env = dbt_env(url, cfg, key)
     project = Path(settings.project_dir).resolve()
@@ -174,7 +199,9 @@ def transform(
     }
     with tempfile.TemporaryDirectory(prefix="transform-") as tmp, psycopg.connect(url, autocommit=True) as conn:
         target = Path(tmp) / "target"
-        for login in pg.break_glass_expire(conn):
+        pg.helpers(conn, cfg)
+        break_glass = pg.break_glass_role(pg.login(conn))
+        for login in pg.break_glass_expire(conn, cfg):
             log.warning("break-glass access for %s expired and was revoked", login)
             if audit:
                 audit("transform.break_glass.revoked", resource=("db_login", [login]), details={})
@@ -188,7 +215,7 @@ def transform(
         built_ok = dbt(project, target, ["build", "--vars", vars_], env)
         manifest = json.loads((target / "manifest.json").read_text())
         summary["tests"] = _results(target / "run_results.json")
-        report = classes.check(manifest)
+        report = classes.check(manifest, cfg.helper_schema)
         summary["classes"] = {"ok": report.ok, "problems": report.problems}
         (target / "classes.json").write_text(json.dumps(report.as_dict(), indent=2))
         built = pg.models(manifest)
@@ -203,7 +230,7 @@ def transform(
             summary["expired"] = pg.expire(conn, cfg, [m.name for m in built])
             summary["rows"] = pg.counts(conn, cfg.build_schema, built)
             if not dry_run:
-                pg.publish(conn, cfg, built)
+                pg.publish(conn, cfg, built, break_glass)
                 summary["published"] = True
                 if audit:
                     audit(

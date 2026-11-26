@@ -7,6 +7,8 @@ approved de-identification:
 
   valxel_tokenize(col)          a keyed token: what it wraps counts as none
   valxel_generalize_year(col)   a date cut to its year: what it wraps counts as none
+                                (both compile to the transform's own helper schema, <schema>_fn: a
+                                function of the same name anywhere else doesn't de-identify)
   count/sum/avg in a model with valxel_min_group(n), n at least MIN_GROUP: what's aggregated counts
                                 as none (group-by columns keep their class; min and max don't
                                 de-identify, they return a value as it is)
@@ -33,7 +35,16 @@ from sqlglot.lineage import Node, lineage
 CLASSES = ("none", "pii", "financial", "phi", "secret")
 RANK = {c: i for i, c in enumerate(CLASSES)}
 MIN_GROUP = 11  # the smallest group an aggregate of personal data may show (decided Nov 24 for PHI)
-DEIDENTIFY = {"valxel.tokenize", "valxel.generalize_year"}
+HELPERS = "transform_fn"  # the default helper schema: transform.yaml's schema + _fn (Config.helper_schema)
+FUNCTIONS = ("tokenize", "generalize_year")  # the de-identifications, in the transform's helper schema
+
+
+def deidentify(helpers: str) -> frozenset[str]:
+    """The de-identification functions by qualified name: only the transform's own, never a
+    function of the same name in another schema."""
+    return frozenset(f"{helpers}.{f}".lower() for f in FUNCTIONS)
+
+
 AGGREGATES = (exp.Count, exp.Sum, exp.Avg)
 
 
@@ -97,7 +108,7 @@ def _func_name(node: exp.Expression) -> str:
     return ""
 
 
-def _shielded(expr: exp.Expression, aggregate_ok: bool) -> set[str]:
+def _shielded(expr: exp.Expression, aggregate_ok: bool, deid: frozenset[str]) -> set[str]:
     """Column names in `expr` that are referenced only inside a de-identification."""
     inside: set[str] = set()
     outside: set[str] = set()
@@ -105,7 +116,7 @@ def _shielded(expr: exp.Expression, aggregate_ok: bool) -> set[str]:
         safe = False
         parent = col.parent
         while isinstance(parent, exp.Expression) and parent is not expr.parent:
-            if _func_name(parent) in DEIDENTIFY:
+            if _func_name(parent) in deid:
                 safe = True
                 break
             if aggregate_ok and isinstance(parent, AGGREGATES):
@@ -116,12 +127,14 @@ def _shielded(expr: exp.Expression, aggregate_ok: bool) -> set[str]:
     return inside - outside
 
 
-def _leaves(node: Node, shielded: bool, out: list[tuple[str, bool]], aggregate_floor: int) -> None:
+def _leaves(
+    node: Node, shielded: bool, out: list[tuple[str, bool]], aggregate_floor: int, deid: frozenset[str]
+) -> None:
     expr = node.expression
     projection = expr.this if isinstance(expr, exp.Alias) else expr
     select = expr.find_ancestor(exp.Select) if isinstance(expr, exp.Expression) else None
     agg_ok = aggregate_floor >= MIN_GROUP or (select is not None and _min_group(select) >= MIN_GROUP)
-    safe_cols = _shielded(projection, agg_ok) if isinstance(projection, exp.Expression) else set()
+    safe_cols = _shielded(projection, agg_ok, deid) if isinstance(projection, exp.Expression) else set()
     if not node.downstream:
         source = node.source
         table = (
@@ -133,11 +146,13 @@ def _leaves(node: Node, shielded: bool, out: list[tuple[str, bool]], aggregate_f
         return
     for child in node.downstream:
         col = child.name.rsplit(".", 1)[-1].lower()
-        _leaves(child, shielded or col in safe_cols, out, 0)
+        _leaves(child, shielded or col in safe_cols, out, 0, deid)
 
 
-def check(manifest: dict[str, Any]) -> Report:
-    """Check every model in a compiled dbt manifest."""
+def check(manifest: dict[str, Any], helpers: str = HELPERS) -> Report:
+    """Check every model in a compiled dbt manifest. `helpers`: the transform's helper schema, where
+    its de-identification functions are."""
+    deid = deidentify(helpers)
     report = Report()
     known: dict[str, dict[str, str]] = {}  # relation -> column -> class
     schema: dict[str, Any] = {}  # catalog -> schema -> table -> column -> type, as sqlglot takes it
@@ -177,7 +192,8 @@ def check(manifest: dict[str, Any]) -> Report:
                 leaves: list[tuple[str, bool]] = []
                 try:
                     root = lineage(col, sql, schema=schema, dialect="postgres")
-                    _leaves(root, False, leaves, _min_group(parsed) if isinstance(parsed, exp.Select) else 0)
+                    floor = _min_group(parsed) if isinstance(parsed, exp.Select) else 0
+                    _leaves(root, False, leaves, floor, deid)
                 except Exception as e:  # noqa: BLE001 - reported as a problem, never skipped
                     entry.problem = f"{name}.{col}: couldn't trace its inputs ({type(e).__name__}: {e})"
                     leaves = []
@@ -243,8 +259,8 @@ def _topological(models: dict[str, dict[str, Any]]) -> list[str]:
     return done
 
 
-def check_file(path: Path) -> Report:
-    return check(json.loads(path.read_text()))
+def check_file(path: Path, helpers: str = HELPERS) -> Report:
+    return check(json.loads(path.read_text()), helpers)
 
 
 def render(report: Report) -> str:

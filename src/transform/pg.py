@@ -11,6 +11,11 @@ reporting_tenants() the raw tables use; a mart view runs with the reader's own r
 transform's login owns and writes the schema; people read through reporting_reader, and write only
 through break-glass, which is time-boxed and audited.
 
+The transform signs in with a login of its own (platform-resources postgres-login): SELECT on the
+source columns its contracts give it, CREATE on the database, and ADMIN on <login>_break_glass. It
+makes everything else itself, with no owner rights: its helper schema (helpers), the build
+schema and the published one.
+
 Every statement is composed with psycopg's sql module: names come from the approved transform.yaml
 and dbt's manifest and are quoted as identifiers; values are bound parameters.
 """
@@ -27,35 +32,61 @@ from psycopg import sql
 
 from .config import Config
 
-READER = "reporting_reader"  # the report logins' role, from template-reporting
-BREAK_GLASS = "transform_break_glass"
+READER = "reporting_reader"  # the report logins' role, made by template-reporting (deployed first)
 MIN_KEY = 32
+FUNCTIONS = ("tokenize", "generalize_year")  # in the transform's helper schema (Config.helper_schema)
 
-SETUP = [
-    "create extension if not exists pgcrypto",
-    "create schema if not exists valxel",
-    # A keyed token. The key is the session's (PGOPTIONS, from the transform's mounted secret): a
-    # session without one, or with a short one, fails instead of producing guessable tokens.
-    f"""create or replace function valxel.tokenize(v text) returns text language plpgsql stable
-        set search_path = pg_catalog, public as $$
-        declare k text := current_setting('valxel.tokenize_key', true);
+
+def break_glass_role(login: str) -> str:
+    """The NOLOGIN role the platform makes beside the transform's login (platform-resources
+    postgres-login, breakGlass): the login administers it, so it grants and revokes it itself."""
+    return f"{login}_break_glass"
+
+
+def helper_sql(helpers: str) -> list[sql.Composed]:
+    """The transform's helper schema, made by its own login (it has CREATE on the database, nothing
+    more): the de-identification functions and the break-glass record. Idempotent; run every time.
+
+    The token is HMAC-SHA256 with the session's key (PGOPTIONS, from the login's secret), written on
+    Postgres's built-in sha256 so it needs no extension. A session without a key, or with a short one,
+    fails instead of producing guessable tokens."""
+    h = sql.Identifier(helpers)
+    return [
+        sql.SQL("create schema if not exists {}").format(h),
+        sql.SQL(
+            """create or replace function {}.tokenize(v text) returns text language plpgsql stable
+        set search_path = pg_catalog as $$
+        declare
+          ks text := current_setting('valxel.tokenize_key', true);
+          k bytea; ipad bytea; opad bytea;
         begin
           if v is null then return null; end if;
-          if k is null or length(k) < {MIN_KEY} then
-            raise exception 'valxel.tokenize: no key of at least {MIN_KEY} characters for this session';
+          if ks is null or length(ks) < {} then
+            raise exception 'tokenize: no key of at least {} characters for this session';
           end if;
-          return encode(hmac(v, k, 'sha256'), 'hex');
-        end $$""",
-    """create or replace function valxel.generalize_year(t timestamptz) returns int language sql immutable
-        set search_path = pg_catalog as $$ select extract(year from t)::int $$""",
-    "grant usage on schema valxel to public",
-    """create table if not exists valxel.break_glass (
+          k := convert_to(ks, 'UTF8');
+          if length(k) > 64 then k := sha256(k); end if;
+          k := k || decode(repeat('00', 64 - length(k)), 'hex');
+          ipad := k; opad := k;
+          for i in 0..63 loop
+            ipad := set_byte(ipad, i, get_byte(k, i) # 54);
+            opad := set_byte(opad, i, get_byte(k, i) # 92);
+          end loop;
+          return encode(sha256(opad || sha256(ipad || convert_to(v, 'UTF8'))), 'hex');
+        end $$"""
+        ).format(h, sql.SQL(str(MIN_KEY)), sql.SQL(str(MIN_KEY))),
+        sql.SQL(
+            """create or replace function {}.generalize_year(t timestamptz) returns int language sql immutable
+        set search_path = pg_catalog as $$ select extract(year from t)::int $$"""
+        ).format(h),
+        sql.SQL(
+            """create table if not exists {}.break_glass (
         login text not null, granted_at timestamptz not null default now(), until timestamptz not null,
-        reason text not null, revoked_at timestamptz)""",
-    "revoke all on valxel.break_glass from public",
-    f"do $$ begin create role {BREAK_GLASS} nologin; exception when duplicate_object then null; end $$",
-    f"do $$ begin create role {READER} nologin; exception when duplicate_object then null; end $$",
-]
+        reason text not null, revoked_at timestamptz)"""
+        ).format(h),
+        sql.SQL("revoke all on schema {} from public").format(h),
+        sql.SQL("revoke all on {}.break_glass from public").format(h),
+    ]
 
 
 def execute(cur: psycopg.Cursor[Any], stmt: sql.SQL | sql.Composed | str, params: list[Any] | None = None) -> None:
@@ -143,12 +174,15 @@ def expire(conn: psycopg.Connection[Any], cfg: Config, existing: Iterable[str]) 
     return out
 
 
-def reader_grants(cfg: Config, built: list[Model]) -> list[sql.Composed]:
-    """What readers and break-glass may do in the published schema: re-applied at every swap."""
-    live = sql.Identifier(cfg.schema)
+def reader_grants(cfg: Config, built: list[Model], break_glass: str) -> list[sql.Composed]:
+    """What readers and break-glass may do in the published schema: re-applied at every swap. Readers
+    also use the helper schema: a mart view that generalizes a year runs with their rights."""
+    live, helpers = sql.Identifier(cfg.schema), sql.Identifier(cfg.helper_schema)
+    who = sql.SQL("{}, {}").format(sql.Identifier(READER), sql.Identifier(break_glass))
     out: list[sql.Composed] = [
         sql.SQL("revoke all on schema {} from public").format(live),
-        sql.SQL("grant usage on schema {} to {}, {}").format(live, sql.Identifier(READER), sql.Identifier(BREAK_GLASS)),
+        sql.SQL("grant usage on schema {} to {}").format(live, who),
+        sql.SQL("grant usage on schema {} to {}").format(helpers, who),
     ]
     for m in built:
         t = sql.SQL("{}.{}").format(live, sql.Identifier(m.name))
@@ -160,7 +194,7 @@ def reader_grants(cfg: Config, built: list[Model]) -> list[sql.Composed]:
         out.append(sql.SQL("grant select on {} to {}").format(t, sql.Identifier(READER)))
         if m.materialized != "view":
             out.append(
-                sql.SQL("grant select, insert, update, delete on {} to {}").format(t, sql.Identifier(BREAK_GLASS))
+                sql.SQL("grant select, insert, update, delete on {} to {}").format(t, sql.Identifier(break_glass))
             )
         if m.tenant and m.materialized != "view":
             out += [
@@ -171,13 +205,13 @@ def reader_grants(cfg: Config, built: list[Model]) -> list[sql.Composed]:
                 ).format(t, sql.Identifier(READER), sql.Identifier(m.tenant)),
                 sql.SQL("drop policy if exists break_glass on {}").format(t),
                 sql.SQL("create policy break_glass on {} for all to {} using (true)").format(
-                    t, sql.Identifier(BREAK_GLASS)
+                    t, sql.Identifier(break_glass)
                 ),
             ]
     return out
 
 
-def publish(conn: psycopg.Connection[Any], cfg: Config, built: list[Model]) -> None:
+def publish(conn: psycopg.Connection[Any], cfg: Config, built: list[Model], break_glass: str) -> None:
     """Swap the build schema in, in one transaction, with readers' grants re-applied."""
     with conn.transaction(), conn.cursor() as cur:
         live, build, old = (sql.Identifier(s) for s in (cfg.schema, cfg.build_schema, cfg.old_schema))
@@ -185,7 +219,7 @@ def publish(conn: psycopg.Connection[Any], cfg: Config, built: list[Model]) -> N
         if _exists(cur, cfg.schema):
             execute(cur, sql.SQL("alter schema {} rename to {}").format(live, old))
         execute(cur, sql.SQL("alter schema {} rename to {}").format(build, live))
-        for stmt in reader_grants(cfg, built):
+        for stmt in reader_grants(cfg, built, break_glass):
             execute(cur, stmt)
         execute(cur, sql.SQL("drop schema if exists {} cascade").format(old))
 
@@ -202,53 +236,60 @@ def counts(conn: psycopg.Connection[Any], schema: str, built: list[Model]) -> di
     return out
 
 
-def grants(cfg: Config, manifest: dict[str, Any], login: str, database: str) -> list[str]:
-    """`transform-admin grants`: what the platform applies for this transform's login, rendered
-    from the approved sources: read only the raw tables it declares, own and write only its schemas."""
-    who = sql.Identifier(login)
-    stmts: list[sql.Composable] = [sql.SQL(s) for s in SETUP]
-    stmts += [
-        # create: the run makes its build schema; it owns that schema and the published one, nothing else.
-        sql.SQL("grant create on database {} to {}").format(sql.Identifier(database), who),
-        sql.SQL("grant usage on schema valxel to {}").format(who),
-    ]
-    for schema in sorted({s for s, _ in sources(manifest)}):
-        stmts.append(sql.SQL("grant usage on schema {} to {}").format(sql.Identifier(schema), who))
-    for schema, table in sources(manifest):
-        stmts.append(sql.SQL("grant select on {}.{} to {}").format(sql.Identifier(schema), sql.Identifier(table), who))
-    stmts += [
-        sql.SQL("grant {} to {} with admin option").format(sql.Identifier(BREAK_GLASS), who),
-        sql.SQL("grant select, insert, update on valxel.break_glass to {}").format(who),
-    ]
-    return [s.as_string(None) for s in stmts]
+def login(conn: psycopg.Connection[Any]) -> str:
+    with conn.cursor() as cur:
+        execute(cur, "select current_user")
+        row = cur.fetchone()
+    return str(row[0]) if row else ""
 
 
-def setup(conn: psycopg.Connection[Any]) -> None:
+def helpers(conn: psycopg.Connection[Any], cfg: Config) -> None:
+    """The helper schema, as the transform's own login: at the start of every run."""
     with conn.transaction(), conn.cursor() as cur:
-        for stmt in SETUP:
+        for stmt in helper_sql(cfg.helper_schema):
             execute(cur, stmt)
 
 
-def break_glass_grant(conn: psycopg.Connection[Any], login: str, until: datetime, reason: str) -> None:
+def dev_setup(conn: psycopg.Connection[Any]) -> None:
+    """CI and local only, on a database whose login may create roles: the roles the platform and
+    template-reporting make in environments (reporting_reader, <login>_break_glass)."""
+    me = login(conn)
     with conn.transaction(), conn.cursor() as cur:
-        execute(
-            cur, "insert into valxel.break_glass (login, until, reason) values (%s, %s, %s)", [login, until, reason]
-        )
-        execute(cur, sql.SQL("grant {} to {}").format(sql.Identifier(BREAK_GLASS), sql.Identifier(login)))
+        for role in (READER, break_glass_role(me)):
+            execute(cur, "select 1 from pg_roles where rolname = %s", [role])
+            if not cur.fetchone():
+                execute(cur, sql.SQL("create role {} nologin").format(sql.Identifier(role)))
 
 
-def break_glass_expire(conn: psycopg.Connection[Any]) -> list[str]:
-    """Revoke every break-glass grant past its time; returns the logins revoked."""
-    revoked = []
+def break_glass_grant(conn: psycopg.Connection[Any], cfg: Config, person: str, until: datetime, reason: str) -> None:
+    helpers(conn, cfg)
+    role = break_glass_role(login(conn))
     with conn.transaction(), conn.cursor() as cur:
         execute(
             cur,
-            "update valxel.break_glass set revoked_at = now() where revoked_at is null and until <= now()"
-            " returning login",
+            sql.SQL("insert into {}.break_glass (login, until, reason) values (%s, %s, %s)").format(
+                sql.Identifier(cfg.helper_schema)
+            ),
+            [person, until, reason],
         )
-        for (login,) in cur.fetchall():
-            execute(cur, "select 1 from pg_roles where rolname = %s", [login])
+        execute(cur, sql.SQL("grant {} to {}").format(sql.Identifier(role), sql.Identifier(person)))
+
+
+def break_glass_expire(conn: psycopg.Connection[Any], cfg: Config) -> list[str]:
+    """Revoke every break-glass grant past its time; returns the logins revoked."""
+    revoked = []
+    role = break_glass_role(login(conn))
+    with conn.transaction(), conn.cursor() as cur:
+        execute(
+            cur,
+            sql.SQL(
+                "update {}.break_glass set revoked_at = now() where revoked_at is null and until <= now()"
+                " returning login"
+            ).format(sql.Identifier(cfg.helper_schema)),
+        )
+        for (person,) in cur.fetchall():
+            execute(cur, "select 1 from pg_roles where rolname = %s", [person])
             if cur.fetchone():
-                execute(cur, sql.SQL("revoke {} from {}").format(sql.Identifier(BREAK_GLASS), sql.Identifier(login)))
-            revoked.append(str(login))
+                execute(cur, sql.SQL("revoke {} from {}").format(sql.Identifier(role), sql.Identifier(person)))
+            revoked.append(str(person))
     return revoked

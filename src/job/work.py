@@ -46,12 +46,12 @@ def _seed(settings: Any, environment: str) -> None:
 
     from transform import pg, seed
     from transform.config import load
-    from transform.run import TransformError, _secret
+    from transform.run import TransformError, database_url
 
     if environment not in SEED_ENVIRONMENTS:
         raise TransformError(f"TRANSFORM_SEED_SYNTHETIC replaces raw tables: refused in {environment}")
     cfg = load(Path(settings.config_path))
-    url = _secret(settings.database_url, settings.database_url_file, "database URL")
+    url = database_url(settings)
     with psycopg.connect(url, autocommit=True) as conn:
-        pg.setup(conn)
+        pg.dev_setup(conn)
         seed.seed(conn, Path(settings.project_dir), Path("contracts"), cfg.source_schema)
