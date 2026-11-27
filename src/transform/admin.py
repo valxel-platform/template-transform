@@ -43,7 +43,10 @@ def check_main(argv: list[str] | None = None) -> int:
     settings = Settings()
     cfg = load(Path(settings.config_path))
     url = _url(settings)
-    env = dbt_env(url, cfg, _secret(settings.tokenize_key, settings.tokenize_key_file, "tokenize key"))
+    key = (
+        "" if settings.tokenize_function else _secret(settings.tokenize_key, settings.tokenize_key_file, "tokenize key")
+    )
+    env = dbt_env(url, cfg, key)
     with tempfile.TemporaryDirectory(prefix="transform-check-") as tmp:
         target = Path(tmp)
         with psycopg.connect(url, autocommit=True) as conn:
@@ -52,7 +55,11 @@ def check_main(argv: list[str] | None = None) -> int:
         if not dbt(Path(settings.project_dir).resolve(), target, ["compile"], env):
             print("the dbt project doesn't compile", file=sys.stderr)
             return 1
-        report = classes.check(json.loads((target / "manifest.json").read_text()), cfg.helper_schema)
+        report = classes.check(
+            json.loads((target / "manifest.json").read_text()),
+            cfg.helper_schema,
+            tokens_deidentify=bool(cfg.expert_determination),
+        )
     print(classes.render(report))
     return 0 if report.ok else 1
 
@@ -72,7 +79,7 @@ def admin_main(argv: list[str] | None = None) -> int:
             print(f"break-glass: 1-{MAX_BREAK_GLASS_MINUTES} minutes and a reason of a few words", file=sys.stderr)
             return 2
         until = datetime.now(UTC) + timedelta(minutes=args.minutes)
-        pg.break_glass_grant(conn, cfg, args.login, until, args.reason.strip())
+        pg.break_glass_grant(conn, cfg, args.login, until, args.reason.strip(), settings.break_glass_role)
         print(f"{args.login} may write the published marts until {until.isoformat()}; recorded")
     return 0
 

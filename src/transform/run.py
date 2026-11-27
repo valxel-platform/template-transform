@@ -47,20 +47,26 @@ class Settings(BaseSettings):
 
     config_path: str = "transform.yaml"
     project_dir: str = "dbt"
-    # The warehouse connection, as the transform's own login (platform-resources postgres-login). In
-    # environments the login's outputs reach the pod as TRANSFORM_PG_HOST, _PORT, _DATABASE, _USER
-    # and _PASSWORD (workload.yaml binds them; the password from its Secret). Otherwise a URL: the
-    # variable for local runs (transform-dev), or a mounted file.
+    # The warehouse connection, as the transform's own login (platform-resources postgres-login, made
+    # by the db-logins controller). In environments the login's outputs reach the pod as
+    # TRANSFORM_PG_HOST, _PORT, _DATABASE, _USER and _AUTH (workload.yaml binds them): it signs in as
+    # its own workload identity with a short-lived token (gcp-iam, azure-entra), and no password
+    # exists (constitution VX-20). Otherwise a URL: the variable for local runs (transform-dev), or a
+    # mounted file.
     pg_host: str = ""
     pg_port: int = 5432
     pg_database: str = ""
     pg_user: str = ""
+    pg_auth: str = "password"  # gcp-iam | azure-entra | password (local and CI only)
     pg_password: str = ""
     pg_sslmode: str = "require"
     database_url: str = ""
     database_url_file: str = "/var/run/secrets/valxel/transform-database-url"
-    # The tokenize key (at least 32 characters): the login's own, bound from its Secret as
-    # TRANSFORM_TOKENIZE_KEY, or a mounted file.
+    # The login's tokenize function and break-glass role (postgres-login outputs). With the function,
+    # tokens come from a versioned key that never leaves the database; without it (local runs and CI)
+    # from tokenize_key, the session's own key (at least 32 characters).
+    tokenize_function: str = ""
+    break_glass_role: str = ""
     tokenize_key: str = ""
     tokenize_key_file: str = "/var/run/secrets/valxel/transform-tokenize-key"
     evidence_dir: str = ""  # where each run's evidence is kept (a mounted volume); unset: not kept
@@ -83,17 +89,43 @@ def _secret(value: str, path: str, what: str) -> str:
         raise TransformError(f"no {what}: mount it at {path}") from e
 
 
+GCP_SCOPE = "https://www.googleapis.com/auth/sqlservice.login"
+AZURE_SCOPE = "https://ossrdbms-aad.database.windows.net/.default"
+
+
+def token(auth: str) -> str:
+    """A short-lived access token for the pod's own workload identity: its database password."""
+    if auth == "gcp-iam":
+        import google.auth
+        import google.auth.transport.requests
+
+        creds, _ = google.auth.default(scopes=[GCP_SCOPE])
+        creds.refresh(google.auth.transport.requests.Request())  # type: ignore[no-untyped-call]
+        return str(creds.token)
+    if auth == "azure-entra":
+        from azure.identity import DefaultAzureCredential
+
+        return str(DefaultAzureCredential().get_token(AZURE_SCOPE).token)
+    raise TransformError(f"TRANSFORM_PG_AUTH: {auth!r} is not gcp-iam, azure-entra or password")
+
+
 def database_url(settings: Settings) -> str:
     """The transform's own login: the bound parts when there are any, else a URL."""
     if settings.pg_host:
-        if not (settings.pg_user and settings.pg_password and settings.pg_database):
-            raise TransformError("TRANSFORM_PG_HOST is set: TRANSFORM_PG_USER, _PASSWORD and _DATABASE are needed too")
+        if not (settings.pg_user and settings.pg_database):
+            raise TransformError("TRANSFORM_PG_HOST is set: TRANSFORM_PG_USER and _DATABASE are needed too")
+        if settings.pg_auth == "password":
+            if not settings.pg_password:
+                raise TransformError("TRANSFORM_PG_AUTH is password: TRANSFORM_PG_PASSWORD is needed (local only)")
+            secret = settings.pg_password
+        else:
+            secret = token(settings.pg_auth)
         return make_conninfo(
             host=settings.pg_host,
             port=settings.pg_port,
             dbname=settings.pg_database,
             user=settings.pg_user,
-            password=settings.pg_password,
+            password=secret,
             sslmode=settings.pg_sslmode,
         )
     return _secret(settings.database_url, settings.database_url_file, "database URL")
@@ -103,9 +135,9 @@ def dbt_env(url: str, cfg: Config, key: str) -> dict[str, str]:
     """What dbt's profile reads (dbt/profiles/profiles.yml). The password and the key reach dbt only
     through DBT_ENV_SECRET_ and libpq's PGOPTIONS, which dbt keeps out of its logs and artifacts."""
     info = conninfo_to_dict(url)
-    if len(key) < pg.MIN_KEY:
+    if key and len(key) < pg.MIN_KEY:
         raise TransformError(f"the tokenize key must be at least {pg.MIN_KEY} characters")
-    return {
+    env = {
         "TRANSFORM_WAREHOUSE": cfg.warehouse,
         "TRANSFORM_PG_HOST": str(info.get("host") or "localhost"),
         "TRANSFORM_PG_PORT": str(info.get("port") or "5432"),
@@ -116,9 +148,11 @@ def dbt_env(url: str, cfg: Config, key: str) -> dict[str, str]:
         "TRANSFORM_BUILD_SCHEMA": cfg.build_schema,
         "TRANSFORM_SOURCE_SCHEMA": cfg.source_schema,
         "TRANSFORM_HELPER_SCHEMA": cfg.helper_schema,
-        "PGOPTIONS": f"-c valxel.tokenize_key={key}",
         "DBT_SEND_ANONYMOUS_USAGE_STATS": "false",  # nothing leaves for dbt Labs; nothing written beside the profile
     }
+    if key:  # local runs and CI only: in environments the key stays in the database
+        env["PGOPTIONS"] = f"-c valxel.tokenize_key={key}"
+    return env
 
 
 @contextlib.contextmanager
@@ -185,7 +219,9 @@ def transform(
     """One run; returns the summary (also logged and kept as evidence). Raises TransformError."""
     cfg = load(Path(settings.config_path))
     url = database_url(settings)
-    key = _secret(settings.tokenize_key, settings.tokenize_key_file, "tokenize key")
+    key = (
+        "" if settings.tokenize_function else _secret(settings.tokenize_key, settings.tokenize_key_file, "tokenize key")
+    )
     env = dbt_env(url, cfg, key)
     project = Path(settings.project_dir).resolve()
     stop = check or (lambda: None)
@@ -199,9 +235,14 @@ def transform(
     }
     with tempfile.TemporaryDirectory(prefix="transform-") as tmp, psycopg.connect(url, autocommit=True) as conn:
         target = Path(tmp) / "target"
-        pg.helpers(conn, cfg)
-        break_glass = pg.break_glass_role(pg.login(conn))
-        for login in pg.break_glass_expire(conn, cfg):
+        pg.helpers(conn, cfg, settings.tokenize_function)
+        break_glass = settings.break_glass_role or pg.break_glass_role(pg.login(conn))
+        # A new tokenize key: every mart is rebuilt in full, so no mart mixes key versions.
+        key_version = pg.key_version(conn, settings.tokenize_function)
+        full = key_version is not None and key_version != pg.last_key_version(conn, cfg)
+        summary["full_refresh"] = full
+        summary["key_version"] = key_version
+        for login in pg.break_glass_expire(conn, cfg, break_glass):
             log.warning("break-glass access for %s expired and was revoked", login)
             if audit:
                 audit("transform.break_glass.revoked", resource=("db_login", [login]), details={})
@@ -209,13 +250,13 @@ def transform(
             raise TransformError("the dbt project doesn't parse")
         manifest = json.loads((target / "manifest.json").read_text())
         incremental = [m.name for m in pg.models(manifest) if m.materialized == "incremental"]
-        summary["copied"] = pg.prepare(conn, cfg, incremental)
+        summary["copied"] = pg.prepare(conn, cfg, [] if full else incremental)
         stop()
         vars_ = json.dumps({"window_start": summary["window"][0], "window_end": summary["window"][1]})
-        built_ok = dbt(project, target, ["build", "--vars", vars_], env)
+        built_ok = dbt(project, target, ["build", "--vars", vars_, *(["--full-refresh"] if full else [])], env)
         manifest = json.loads((target / "manifest.json").read_text())
         summary["tests"] = _results(target / "run_results.json")
-        report = classes.check(manifest, cfg.helper_schema)
+        report = classes.check(manifest, cfg.helper_schema, tokens_deidentify=bool(cfg.expert_determination))
         summary["classes"] = {"ok": report.ok, "problems": report.problems}
         (target / "classes.json").write_text(json.dumps(report.as_dict(), indent=2))
         built = pg.models(manifest)
@@ -232,6 +273,8 @@ def transform(
             if not dry_run:
                 pg.publish(conn, cfg, built, break_glass)
                 summary["published"] = True
+                if key_version is not None:
+                    pg.record_key_version(conn, cfg, key_version)
                 if audit:
                     audit(
                         "transform.published",

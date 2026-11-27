@@ -22,6 +22,7 @@ and dbt's manifest and are quoted as identifiers; values are bound parameters.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime
@@ -34,6 +35,7 @@ from .config import Config
 
 READER = "reporting_reader"  # the report logins' role, made by template-reporting (deployed first)
 MIN_KEY = 32
+_NAME = re.compile(r"^[a-z_][a-z0-9_]{0,62}$")
 FUNCTIONS = ("tokenize", "generalize_year")  # in the transform's helper schema (Config.helper_schema)
 
 
@@ -43,17 +45,22 @@ def break_glass_role(login: str) -> str:
     return f"{login}_break_glass"
 
 
-def helper_sql(helpers: str) -> list[sql.Composed]:
+def helper_sql(helpers: str, tokenize_function: str = "") -> list[sql.Composed]:
     """The transform's helper schema, made by its own login (it has CREATE on the database, nothing
-    more): the de-identification functions and the break-glass record. Idempotent; run every time.
+    more): the de-identification functions, the break-glass record and the run state. Idempotent.
 
-    The token is HMAC-SHA256 with the session's key (PGOPTIONS, from the login's secret), written on
-    Postgres's built-in sha256 so it needs no extension. A session without a key, or with a short one,
-    fails instead of producing guessable tokens."""
+    In environments `tokenize` calls the database's own tokenize function (tokenize_function, a
+    postgres-login output): HMAC-SHA256 with a versioned key that never leaves the database, tokens
+    reading "v2:...". Without one (local runs and CI), it is the same HMAC with the session's key
+    (PGOPTIONS), tokens reading "v0:...", and a session without a key of 32+ characters fails."""
     h = sql.Identifier(helpers)
-    return [
-        sql.SQL("create schema if not exists {}").format(h),
-        sql.SQL(
+    if tokenize_function:
+        tokenize = sql.SQL(
+            """create or replace function {}.tokenize(v text) returns text language sql stable
+        set search_path = pg_catalog as $$ select {}(v) $$"""
+        ).format(h, _qualified(tokenize_function))
+    else:
+        tokenize = sql.SQL(
             """create or replace function {}.tokenize(v text) returns text language plpgsql stable
         set search_path = pg_catalog as $$
         declare
@@ -72,9 +79,12 @@ def helper_sql(helpers: str) -> list[sql.Composed]:
             ipad := set_byte(ipad, i, get_byte(k, i) # 54);
             opad := set_byte(opad, i, get_byte(k, i) # 92);
           end loop;
-          return encode(sha256(opad || sha256(ipad || convert_to(v, 'UTF8'))), 'hex');
+          return 'v0:' || encode(sha256(opad || sha256(ipad || convert_to(v, 'UTF8'))), 'hex');
         end $$"""
-        ).format(h, sql.SQL(str(MIN_KEY)), sql.SQL(str(MIN_KEY))),
+        ).format(h, sql.SQL(str(MIN_KEY)), sql.SQL(str(MIN_KEY)))
+    return [
+        sql.SQL("create schema if not exists {}").format(h),
+        tokenize,
         sql.SQL(
             """create or replace function {}.generalize_year(t timestamptz) returns int language sql immutable
         set search_path = pg_catalog as $$ select extract(year from t)::int $$"""
@@ -84,9 +94,44 @@ def helper_sql(helpers: str) -> list[sql.Composed]:
         login text not null, granted_at timestamptz not null default now(), until timestamptz not null,
         reason text not null, revoked_at timestamptz)"""
         ).format(h),
+        sql.SQL("create table if not exists {}.state (key_version int)").format(h),
         sql.SQL("revoke all on schema {} from public").format(h),
         sql.SQL("revoke all on {}.break_glass from public").format(h),
+        sql.SQL("revoke all on {}.state from public").format(h),
     ]
+
+
+def _qualified(name: str) -> sql.Composable:
+    """A schema-qualified function name from a login's output (<login>_key.tokenize)."""
+    parts = name.split(".")
+    if len(parts) != 2 or not all(_NAME.match(p) for p in parts):
+        raise ValueError(f"not a schema-qualified function: {name!r}")
+    return sql.SQL(".").join(sql.Identifier(p) for p in parts)
+
+
+def key_version(conn: psycopg.Connection[Any], tokenize_function: str) -> int | None:
+    """The database's active tokenize key version (<login>_key.key_version()); None without one."""
+    if not tokenize_function:
+        return None
+    schema = tokenize_function.split(".")[0]
+    with conn.cursor() as cur:
+        execute(cur, sql.SQL("select {}()").format(_qualified(f"{schema}.key_version")))
+        row = cur.fetchone()
+    return int(row[0]) if row and row[0] is not None else None
+
+
+def last_key_version(conn: psycopg.Connection[Any], cfg: Config) -> int | None:
+    with conn.cursor() as cur:
+        execute(cur, sql.SQL("select max(key_version) from {}.state").format(sql.Identifier(cfg.helper_schema)))
+        row = cur.fetchone()
+    return int(row[0]) if row and row[0] is not None else None
+
+
+def record_key_version(conn: psycopg.Connection[Any], cfg: Config, version: int) -> None:
+    with conn.transaction(), conn.cursor() as cur:
+        h = sql.Identifier(cfg.helper_schema)
+        execute(cur, sql.SQL("delete from {}.state").format(h))
+        execute(cur, sql.SQL("insert into {}.state (key_version) values (%s)").format(h), [version])
 
 
 def execute(cur: psycopg.Cursor[Any], stmt: sql.SQL | sql.Composed | str, params: list[Any] | None = None) -> None:
@@ -243,10 +288,10 @@ def login(conn: psycopg.Connection[Any]) -> str:
     return str(row[0]) if row else ""
 
 
-def helpers(conn: psycopg.Connection[Any], cfg: Config) -> None:
+def helpers(conn: psycopg.Connection[Any], cfg: Config, tokenize_function: str = "") -> None:
     """The helper schema, as the transform's own login: at the start of every run."""
     with conn.transaction(), conn.cursor() as cur:
-        for stmt in helper_sql(cfg.helper_schema):
+        for stmt in helper_sql(cfg.helper_schema, tokenize_function):
             execute(cur, stmt)
 
 
@@ -261,9 +306,12 @@ def dev_setup(conn: psycopg.Connection[Any]) -> None:
                 execute(cur, sql.SQL("create role {} nologin").format(sql.Identifier(role)))
 
 
-def break_glass_grant(conn: psycopg.Connection[Any], cfg: Config, person: str, until: datetime, reason: str) -> None:
+def break_glass_grant(
+    conn: psycopg.Connection[Any], cfg: Config, person: str, until: datetime, reason: str, role: str = ""
+) -> None:
+    """`role`: the login's break-glass role (a postgres-login output); by default <login>_break_glass."""
     helpers(conn, cfg)
-    role = break_glass_role(login(conn))
+    role = role or break_glass_role(login(conn))
     with conn.transaction(), conn.cursor() as cur:
         execute(
             cur,
@@ -275,10 +323,10 @@ def break_glass_grant(conn: psycopg.Connection[Any], cfg: Config, person: str, u
         execute(cur, sql.SQL("grant {} to {}").format(sql.Identifier(role), sql.Identifier(person)))
 
 
-def break_glass_expire(conn: psycopg.Connection[Any], cfg: Config) -> list[str]:
+def break_glass_expire(conn: psycopg.Connection[Any], cfg: Config, role: str = "") -> list[str]:
     """Revoke every break-glass grant past its time; returns the logins revoked."""
     revoked = []
-    role = break_glass_role(login(conn))
+    role = role or break_glass_role(login(conn))
     with conn.transaction(), conn.cursor() as cur:
         execute(
             cur,

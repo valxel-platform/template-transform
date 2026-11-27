@@ -43,8 +43,9 @@ def manifest(sql: str, declared: dict[str, str], *, extra: dict | None = None, s
     }
 
 
-def problems(sql: str, declared: dict[str, str], **kw) -> list[str]:
-    return check(manifest(sql, declared, **kw)).problems
+def problems(sql: str, declared: dict[str, str], tokens: bool = True, **kw) -> list[str]:
+    """`tokens`: as with an Expert Determination recorded (most tests are about the mechanics)."""
+    return check(manifest(sql, declared, **kw), tokens_deidentify=tokens).problems
 
 
 def test_a_column_keeps_its_sources_class():
@@ -145,7 +146,10 @@ def test_a_source_column_without_a_class_fails():
 
 
 def test_the_report_names_each_columns_inputs():
-    report = check(manifest(f"select transform_fn.tokenize((patient_id)::text) as t from {SRC}", {"t": "none"}))
+    report = check(
+        manifest(f"select transform_fn.tokenize((patient_id)::text) as t from {SRC}", {"t": "none"}),
+        tokens_deidentify=True,
+    )
     assert report.ok and report.as_dict()["columns"] == [
         {
             "model": "mart",
@@ -174,5 +178,26 @@ def test_a_deletions_hook_rendered_at_parse_time_is_caught():
 def test_only_the_transforms_own_helpers_de_identify():
     assert problems(f"select other.tokenize((patient_id)::text) as t from {SRC}", {"t": "none"})
     assert problems(f"select tokenize((patient_id)::text) as t from {SRC}", {"t": "none"})
-    found = check(manifest(f"select emr_fn.tokenize((patient_id)::text) as t from {SRC}", {"t": "none"}), "emr_fn")
+    found = check(
+        manifest(f"select emr_fn.tokenize((patient_id)::text) as t from {SRC}", {"t": "none"}),
+        "emr_fn",
+        tokens_deidentify=True,
+    )
     assert found.problems == []
+
+
+def test_without_an_expert_determination_a_token_keeps_its_sources_class():
+    # A token is derived from the id it replaces: not a Safe Harbor code (45 CFR 164.514(c)).
+    sql = f"select transform_fn.tokenize((patient_id)::text) as t from {SRC}"
+    [found] = problems(sql, {"t": "none"}, tokens=False)
+    assert "patient_id (phi)" in found
+    assert problems(sql, {"t": "phi"}, tokens=False) == []
+    # Generalizing a date to its year is Safe Harbor's own rule: it counts either way.
+    assert (
+        problems(
+            f"select transform_fn.generalize_year((signed_at)::timestamptz) as y from {SRC}",
+            {"y": "none"},
+            tokens=False,
+        )
+        == []
+    )
