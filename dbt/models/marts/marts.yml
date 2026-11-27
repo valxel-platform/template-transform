@@ -18,7 +18,9 @@ models:
       - { name: note_id, meta: { data_class: none }, data_tests: [unique, not_null] }
       - { name: kind, meta: { data_class: none } }
       - { name: clinic_id, meta: { data_class: none } }
-      - { name: patient_token, meta: { data_class: none } }
+      # A token is derived from the patient's id, so it stays PHI unless an Expert Determination says
+      # otherwise (transform.yaml expert_determination). The year and the counts are de-identified.
+      - { name: patient_token, meta: { data_class: phi } }
       - { name: signed_year, meta: { data_class: none } }
       - { name: _updated_at, meta: { data_class: none } }
   - name: notes_by_clinic_year

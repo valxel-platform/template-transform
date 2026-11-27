@@ -39,10 +39,16 @@ HELPERS = "transform_fn"  # the default helper schema: transform.yaml's schema +
 FUNCTIONS = ("tokenize", "generalize_year")  # the de-identifications, in the transform's helper schema
 
 
-def deidentify(helpers: str) -> frozenset[str]:
+def deidentify(helpers: str, tokens: bool = False) -> frozenset[str]:
     """The de-identification functions by qualified name: only the transform's own, never a
-    function of the same name in another schema."""
-    return frozenset(f"{helpers}.{f}".lower() for f in FUNCTIONS)
+    function of the same name in another schema.
+
+    A token is derived from the identifier it replaces, and HIPAA's Safe Harbor method excepts only
+    codes that are not (45 CFR 164.514(c)). So a token counts as de-identifying only when the
+    transform records an Expert Determination that says it does (transform.yaml
+    expert_determination); otherwise a tokenized column keeps its source's class. Generalizing a
+    date to its year is Safe Harbor's own rule, and always counts."""
+    return frozenset(f"{helpers}.{f}".lower() for f in FUNCTIONS if tokens or f != "tokenize")
 
 
 AGGREGATES = (exp.Count, exp.Sum, exp.Avg)
@@ -149,10 +155,10 @@ def _leaves(
         _leaves(child, shielded or col in safe_cols, out, 0, deid)
 
 
-def check(manifest: dict[str, Any], helpers: str = HELPERS) -> Report:
+def check(manifest: dict[str, Any], helpers: str = HELPERS, tokens_deidentify: bool = False) -> Report:
     """Check every model in a compiled dbt manifest. `helpers`: the transform's helper schema, where
     its de-identification functions are."""
-    deid = deidentify(helpers)
+    deid = deidentify(helpers, tokens_deidentify)
     report = Report()
     known: dict[str, dict[str, str]] = {}  # relation -> column -> class
     schema: dict[str, Any] = {}  # catalog -> schema -> table -> column -> type, as sqlglot takes it
@@ -259,8 +265,8 @@ def _topological(models: dict[str, dict[str, Any]]) -> list[str]:
     return done
 
 
-def check_file(path: Path, helpers: str = HELPERS) -> Report:
-    return check(json.loads(path.read_text()), helpers)
+def check_file(path: Path, helpers: str = HELPERS, tokens_deidentify: bool = False) -> Report:
+    return check(json.loads(path.read_text()), helpers, tokens_deidentify)
 
 
 def render(report: Report) -> str:

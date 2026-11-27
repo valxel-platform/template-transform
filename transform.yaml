@@ -5,5 +5,7 @@ name: template-transform
 warehouse: postgres            # postgres (the reporting store's database) or snowflake (later)
 schema: transform              # what readers see; each run builds in <schema>_build and swaps it in
 source_schema: public          # where reporting's raw tables are
+# expert_determination: ""     # a reference to the Expert Determination that lets tokens count as
+#                               # de-identifying; without one a tokenized column keeps its source's class
 marts:                         # retention per mart that keeps history (incremental); others follow their sources
   notes_signed: { retention_days: 2555, retention_column: _updated_at }

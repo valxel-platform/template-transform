@@ -31,6 +31,9 @@ class Config:
     schema: str = "transform"
     source_schema: str = "public"
     marts: dict[str, Mart] = field(default_factory=dict)
+    # The Expert Determination (45 CFR 164.514(b)(1)) that lets tokens count as de-identifying: a
+    # reference to the expert's written determination, recorded by a person. Empty: they don't.
+    expert_determination: str = ""
 
     @property
     def build_schema(self) -> str:
@@ -76,7 +79,10 @@ def parse(raw: Any) -> Config:
             marts[str(mname)] = Mart(str(mname), int(days), column)  # type: ignore[arg-type]
     if problems:
         raise ConfigError("; ".join(problems))
-    return Config(name=name, warehouse=warehouse, schema=schema, source_schema=source, marts=marts)
+    expert = str(raw.get("expert_determination") or "").strip()
+    return Config(
+        name=name, warehouse=warehouse, schema=schema, source_schema=source, marts=marts, expert_determination=expert
+    )
 
 
 def load(path: Path) -> Config:

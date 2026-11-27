@@ -159,7 +159,7 @@ def test_a_report_login_sees_only_its_tenants_marts_and_nothing_raw(warehouse):
     with pytest.raises(Exception, match="permission denied"):
         sql("select count(*) from transform.stg_notes", url=reader)
     tokens = sql("select patient_token, signed_year from transform.notes_signed limit 1", url=reader)[0]
-    assert len(tokens[0]) == 64 and not tokens[0].startswith("patient") and tokens[1] == 2025
+    assert tokens[0].startswith("v0:") and len(tokens[0]) == 67 and tokens[1] == 2025
 
 
 def test_a_deleted_record_is_gone_from_every_mart_that_carries_it(warehouse):
@@ -253,7 +253,7 @@ def test_tokens_need_the_sessions_key_and_are_hmac_sha256(warehouse):
         sql("select transform_fn.tokenize('x')")
     for key in (KEY, "é" * 40, "x" * 100):  # multi-byte, and longer than a block
         [(token,)] = sql(f"set valxel.tokenize_key = '{key}'", "select transform_fn.tokenize('patient-ü-1')")
-        assert token == hmac.new(key.encode(), "patient-ü-1".encode(), hashlib.sha256).hexdigest()
+        assert token == "v0:" + hmac.new(key.encode(), "patient-ü-1".encode(), hashlib.sha256).hexdigest()
 
 
 def test_the_login_owns_its_schemas_and_nothing_more(warehouse):
@@ -264,3 +264,30 @@ def test_the_login_owns_its_schemas_and_nothing_more(warehouse):
     assert attrs == [(False, False, False)]
     with pytest.raises(Exception, match="permission denied"):
         sql("insert into public.notes (note_id) values ('x')", url=login_url())
+
+
+def test_with_the_databases_tokenize_function_a_new_key_rebuilds_every_mart(warehouse):
+    """As the db-logins controller makes it: <login>_key.tokenize and key_version, owned by a role the
+    transform can't read the key through. A new key version rebuilds every mart in full, so no mart
+    mixes versions; the same version again doesn't."""
+    sql(
+        "drop schema if exists emr_transform_key cascade",
+        "create schema emr_transform_key",
+        "create table emr_transform_key.v (n int)",
+        "insert into emr_transform_key.v values (7)",
+        "create or replace function emr_transform_key.key_version() returns int language sql stable security definer"
+        " as $$ select n from emr_transform_key.v $$",
+        "create or replace function emr_transform_key.tokenize(t text) returns text language sql stable security"
+        " definer as $$ select 'v' || (select n from emr_transform_key.v) || ':' || md5(t) $$",
+        f"grant usage on schema emr_transform_key to {LOGIN}",
+        f"grant execute on all functions in schema emr_transform_key to {LOGIN}",
+    )
+    settings = warehouse.model_copy(update={"tokenize_function": "emr_transform_key.tokenize", "tokenize_key": ""})
+    first = run(settings)
+    assert first["full_refresh"] and first["key_version"] == 7
+    assert {t[:3] for (t,) in sql("select patient_token from transform.notes_signed")} == {"v7:"}
+    assert not run(settings)["full_refresh"]
+    sql("update emr_transform_key.v set n = 8")
+    again = run(settings)
+    assert again["full_refresh"] and again["copied"] == []
+    assert {t[:3] for (t,) in sql("select patient_token from transform.notes_signed")} == {"v8:"}
